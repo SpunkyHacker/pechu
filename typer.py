@@ -9,29 +9,27 @@ import mlx_whisper
 
 # --- CONFIGURATION ---
 SAMPLE_RATE = 16000
-CHUNK_DURATION = 2.5  # Seconds per live update while speaking
-MODEL_REPO = "mlx-community/whisper-small-mlx"  # Fast & accurate on M-series
-TRIGGER_KEY = keyboard.Key.alt_r  # Hold Right Option key to talk
+UPDATE_INTERVAL = 0.5  # Transcribe every 0.5 seconds for instant word appearance
+MODEL_REPO = "mlx-community/whisper-small-mlx" 
+TRIGGER_KEY = keyboard.Key.alt_r  
 
 # --- STATE ---
 is_recording = False
 audio_queue = queue.Queue()
 kb_controller = keyboard.Controller()
 
-print("Pre-loading Whisper model into unified memory...")
-# Warm up the model with 1 second of silence so the first press is instant
+print("Loading model into unified memory...")
 mlx_whisper.transcribe(np.zeros(SAMPLE_RATE, dtype=np.float32), path_or_hf_repo=MODEL_REPO)
-print("✅ Ready! Hold DOWN [Right Option] anywhere and start talking...")
+print("✅ Ready! Hold DOWN [Right Option] and start talking...")
 
 
 def paste_text(text: str):
     """Injects text instantly at the cursor via macOS clipboard."""
-    cleaned = text.strip()
-    if not cleaned:
+    if not text:
         return
     
-    # Add a trailing space so consecutive chunks don't mash together
-    payload = cleaned + " "
+    # Add a trailing space so the next batch of words doesn't stick
+    payload = text + " "
     
     # Copy to macOS clipboard using pbcopy
     process = subprocess.Popen(['pbcopy'], stdin=subprocess.PIPE)
@@ -43,61 +41,74 @@ def paste_text(text: str):
 
 
 def audio_callback(indata, frames, time_info, status):
-    """Triggered continuously by sounddevice while mic stream is open."""
     if is_recording:
         audio_queue.put(indata.copy())
 
 
 def transcription_worker():
-    """Background thread that transcribes audio chunks as you speak."""
-    buffer = []
-    samples_per_chunk = int(SAMPLE_RATE * CHUNK_DURATION)
-
+    global is_recording
+    
+    audio_buffer = []
+    typed_word_count = 0
+    last_process_time = time.time()
+    
     while True:
         try:
-            # Wait briefly for incoming audio frames
-            frame = audio_queue.get(timeout=0.1)
-            buffer.append(frame)
-            
-            current_samples = sum(len(f) for f in buffer)
-            
-            # If we hit 2.5 seconds of audio while still holding the key, transcribe it live
-            if current_samples >= samples_per_chunk:
-                audio_data = np.concatenate(buffer, axis=0).flatten()
-                buffer = []  # Reset buffer for next words
-                
-                result = mlx_whisper.transcribe(
-                    audio_data,
-                    path_or_hf_repo=MODEL_REPO,
-                    fp16=True,
-                    language="en"
-                )
-                paste_text(result.get("text", ""))
-
+            # Grab audio frames rapidly
+            frame = audio_queue.get(timeout=0.05)
+            audio_buffer.append(frame)
         except queue.Empty:
-            # If key was released and we have leftover audio in the buffer, flush it
-            if not is_recording and len(buffer) > 0:
-                audio_data = np.concatenate(buffer, axis=0).flatten()
-                buffer = []
+            pass
+
+        # If key is released, reset everything for the next button press
+        if not is_recording:
+            audio_buffer = []
+            typed_word_count = 0
+            continue
+
+        current_time = time.time()
+        
+        # Every 0.5 seconds, transcribe the ENTIRE growing audio buffer
+        if current_time - last_process_time >= UPDATE_INTERVAL and len(audio_buffer) > 0:
+            last_process_time = current_time
+            
+            # Combine all audio recorded so far during this key press
+            audio_data = np.concatenate(audio_buffer, axis=0).flatten()
+            
+            # Skip if audio is too short (prevents Whisper hallucinations)
+            if len(audio_data) < SAMPLE_RATE * 0.5:
+                continue
+
+            # Run the transcription
+            result = mlx_whisper.transcribe(
+                audio_data, 
+                path_or_hf_repo=MODEL_REPO, 
+                fp16=True, 
+                language="en"
+            )
+            current_text = result.get("text", "").strip()
+            
+            # Split the recognized text into a list of words
+            current_words = current_text.split()
+            
+            # If Whisper found new words we haven't typed yet...
+            if len(current_words) > typed_word_count:
+                # Extract ONLY the new words
+                new_words = current_words[typed_word_count:]
+                new_text = " ".join(new_words)
                 
-                # Ignore accidental taps shorter than 0.3 seconds
-                if len(audio_data) > SAMPLE_RATE * 0.3:
-                    result = mlx_whisper.transcribe(
-                        audio_data,
-                        path_or_hf_repo=MODEL_REPO,
-                        fp16=True,
-                        language="en"
-                    )
-                    paste_text(result.get("text", ""))
+                paste_text(new_text)
+                
+                # Update our count so we don't type them again
+                typed_word_count = len(current_words)
 
 
 # Start the background transcription thread
 threading.Thread(target=transcription_worker, daemon=True).start()
 
-# Open the microphone stream (stays idle until is_recording is True)
+# Open the microphone stream
 stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype='float32', callback=audio_callback)
 stream.start()
-
 
 def on_press(key):
     global is_recording
@@ -105,13 +116,11 @@ def on_press(key):
         is_recording = True
         print("🎙️ Listening...")
 
-
 def on_release(key):
     global is_recording
     if key == TRIGGER_KEY and is_recording:
         is_recording = False
         print("⏹️ Stopped.")
-
 
 # Listen for global hotkeys
 with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
